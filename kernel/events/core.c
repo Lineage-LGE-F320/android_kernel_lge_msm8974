@@ -36,6 +36,7 @@
 #include <linux/perf_event.h>
 #include <linux/ftrace_event.h>
 #include <linux/hw_breakpoint.h>
+#include <linux/compat.h>
 
 #include "internal.h"
 
@@ -1351,11 +1352,11 @@ static void __ref perf_remove_from_context(struct perf_event *event, bool detach
 {
 	struct perf_event_context *ctx = event->ctx;
 	struct task_struct *task = ctx->task;
-	int ret;
 	struct remove_event re = {
 		.event = event,
 		.detach_group = detach_group,
 	};
+	int ret;
 
 	lockdep_assert_held(&ctx->mutex);
 
@@ -1824,6 +1825,16 @@ retry:
 	 */
 	if (ctx->is_active) {
 		raw_spin_unlock_irq(&ctx->lock);
+		/*
+		 * Reload the task pointer, it might have been changed by
+		 * a concurrent perf_event_context_sched_out().
+		 */
+		task = ctx->task;
+		/*
+		 * Reload the task pointer, it might have been changed by
+		 * a concurrent perf_event_context_sched_out().
+		 */
+		task = ctx->task;
 		goto retry;
 	}
 
@@ -2135,9 +2146,6 @@ static void __perf_event_sync_stat(struct perf_event *event,
 	perf_event_update_userpage(event);
 	perf_event_update_userpage(next_event);
 }
-
-#define list_next_entry(pos, member) \
-	list_entry(pos->member.next, typeof(*pos), member)
 
 static void perf_event_sync_stat(struct perf_event_context *ctx,
 				   struct perf_event_context *next_ctx)
@@ -3527,6 +3535,25 @@ static long perf_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 	return ret;
 }
 
+#ifdef CONFIG_COMPAT
+static long perf_compat_ioctl(struct file *file, unsigned int cmd,
+				unsigned long arg)
+{
+	switch (_IOC_NR(cmd)) {
+	case _IOC_NR(PERF_EVENT_IOC_SET_FILTER):
+		/* Fix up pointer size (usually 4 -> 8 in 32-on-64-bit case */
+		if (_IOC_SIZE(cmd) == sizeof(compat_uptr_t)) {
+			cmd &= ~IOCSIZE_MASK;
+			cmd |= sizeof(void *) << IOCSIZE_SHIFT;
+		}
+		break;
+	}
+	return perf_ioctl(file, cmd, arg);
+}
+#else
+# define perf_compat_ioctl NULL
+#endif
+
 int perf_event_task_enable(void)
 {
 	struct perf_event_context *ctx;
@@ -3948,7 +3975,7 @@ again:
 	if (vma->vm_flags & VM_WRITE)
 		flags |= RING_BUFFER_WRITABLE;
 
-	rb = rb_alloc(nr_pages, 
+	rb = rb_alloc(nr_pages,
 		event->attr.watermark ? event->attr.wakeup_watermark : 0,
 		event->cpu, flags);
 
@@ -4006,7 +4033,7 @@ static const struct file_operations perf_fops = {
 	.read			= perf_read,
 	.poll			= perf_poll,
 	.unlocked_ioctl		= perf_ioctl,
-	.compat_ioctl		= perf_ioctl,
+	.compat_ioctl		= perf_compat_ioctl,
 	.mmap			= perf_mmap,
 	.fasync			= perf_fasync,
 };
@@ -4040,6 +4067,13 @@ static void perf_pending_event(struct irq_work *entry)
 {
 	struct perf_event *event = container_of(entry,
 			struct perf_event, pending);
+	int rctx;
+
+	rctx = perf_swevent_get_recursion_context();
+	/*
+	 * If we 'fail' here, that's OK, it means recursion is already disabled
+	 * and we won't recurse 'further'.
+	 */
 
 	if (event->pending_disable) {
 		event->pending_disable = 0;
@@ -4050,6 +4084,9 @@ static void perf_pending_event(struct irq_work *entry)
 		event->pending_wakeup = 0;
 		perf_event_wakeup(event);
 	}
+
+	if (rctx >= 0)
+		perf_swevent_put_recursion_context(rctx);
 }
 
 /*
@@ -5512,6 +5549,10 @@ static int perf_tp_filter_match(struct perf_event *event,
 {
 	void *record = data->raw->data;
 
+	/* only top level events have filters set */
+	if (event->parent)
+		event = event->parent;
+
 	if (likely(!event->filter) || filter_match_preds(event->filter, record))
 		return 1;
 	return 0;
@@ -6532,6 +6573,37 @@ static void mutex_lock_double(struct mutex *a, struct mutex *b)
 	mutex_lock_nested(b, SINGLE_DEPTH_NESTING);
 }
 
+/*
+ * Variation on perf_event_ctx_lock_nested(), except we take two context
+ * mutexes.
+ */
+static struct perf_event_context *
+__perf_event_ctx_lock_double(struct perf_event *group_leader,
+			     struct perf_event_context *ctx)
+{
+	struct perf_event_context *gctx;
+
+again:
+	rcu_read_lock();
+	gctx = ACCESS_ONCE(group_leader->ctx);
+	if (!atomic_inc_not_zero(&gctx->refcount)) {
+		rcu_read_unlock();
+		goto again;
+	}
+	rcu_read_unlock();
+
+	mutex_lock_double(&gctx->mutex, &ctx->mutex);
+
+	if (group_leader->ctx != gctx) {
+		mutex_unlock(&ctx->mutex);
+		mutex_unlock(&gctx->mutex);
+		put_ctx(gctx);
+		goto again;
+	}
+
+	return gctx;
+}
+
 /**
  * sys_perf_event_open - open a performance event, associate it to a task/cpu
  *
@@ -6747,7 +6819,26 @@ SYSCALL_DEFINE5(perf_event_open,
 	}
 
 	if (move_group) {
-		gctx = group_leader->ctx;
+		gctx = __perf_event_ctx_lock_double(group_leader, ctx);
+
+		/*
+		 * Check if we raced against another sys_perf_event_open() call
+		 * moving the software group underneath us.
+		 */
+		if (!(group_leader->group_flags & PERF_GROUP_SOFTWARE)) {
+			/*
+			 * If someone moved the group out from under us, check
+			 * if this new event wound up on the same ctx, if so
+			 * its the regular !move_group case, otherwise fail.
+			 */
+			if (gctx != ctx) {
+				err = -EINVAL;
+				goto err_locked;
+			} else {
+				perf_event_ctx_unlock(group_leader, gctx);
+				move_group = 0;
+			}
+		}
 
 		/*
 		 * See perf_event_ctx_lock() for comments on the details
@@ -6795,7 +6886,7 @@ SYSCALL_DEFINE5(perf_event_open,
 	perf_unpin_context(ctx);
 
 	if (move_group) {
-		mutex_unlock(&gctx->mutex);
+		perf_event_ctx_unlock(group_leader, gctx);
 		put_ctx(gctx);
 	}
 	mutex_unlock(&ctx->mutex);
@@ -6824,6 +6915,11 @@ SYSCALL_DEFINE5(perf_event_open,
 	fd_install(event_fd, event_file);
 	return event_fd;
 
+err_locked:
+	if (move_group)
+		perf_event_ctx_unlock(group_leader, gctx);
+	mutex_unlock(&ctx->mutex);
+	fput(event_file);
 err_context:
 	perf_unpin_context(ctx);
 	put_ctx(ctx);
@@ -7405,8 +7501,10 @@ int perf_event_init_task(struct task_struct *child)
 
 	for_each_task_context_nr(ctxn) {
 		ret = perf_event_init_context(child, ctxn);
-		if (ret)
+		if (ret) {
+			perf_event_free_task(child);
 			return ret;
+		}
 	}
 
 	return 0;

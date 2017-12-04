@@ -224,6 +224,8 @@ static ssize_t power_ro_lock_show(struct device *dev,
 
 	ret = snprintf(buf, PAGE_SIZE, "%d\n", locked);
 
+	mmc_blk_put(md);
+
 	return ret;
 }
 
@@ -1631,6 +1633,8 @@ static int mmc_blk_err_check(struct mmc_card *card,
 		u32 status;
 		unsigned long timeout;
 
+		timeout = jiffies + msecs_to_jiffies(MMC_BLK_TIMEOUT_MS);
+
 		/* Check stop command response */
 		if (brq->stop.resp[0] & R1_ERROR) {
 			pr_err("%s: %s: general error sending stop command, stop cmd response %#x\n",
@@ -1639,7 +1643,6 @@ static int mmc_blk_err_check(struct mmc_card *card,
 			gen_err = 1;
 		}
 
-		timeout = jiffies + msecs_to_jiffies(MMC_BLK_TIMEOUT_MS);
 		do {
 			int err = get_card_status(card, &status, 5);
 			if (err) {
@@ -1665,6 +1668,7 @@ static int mmc_blk_err_check(struct mmc_card *card,
 
 				return MMC_BLK_CMD_ERR;
 			}
+
 			/*
 			 * Some cards mishandle the status bits,
 			 * so make sure to check both the busy
@@ -1676,7 +1680,7 @@ static int mmc_blk_err_check(struct mmc_card *card,
 
 	/* if general error occurs, retry the write operation. */
 	if (gen_err) {
-		pr_warn("%s: retrying write for general error\n",
+		pr_warning("%s: retrying write for general error\n",
 				req->rq_disk->disk_name);
 		return MMC_BLK_RETRY;
 	}
@@ -2654,21 +2658,19 @@ static int mmc_blk_issue_rw_rq(struct mmc_queue *mq, struct request *rqc)
 			break;
 		case MMC_BLK_CMD_ERR:
 			ret = mmc_blk_cmd_err(md, card, brq, req, ret);
-			if (!mmc_blk_reset(md, card->host, type)) {
-				if (!ret) {
-					/*
-					 * We have successfully completed block
-					 * request and notified to upper layers.
-					 * As the reset is successful, assume
-					 * h/w is in clean state and proceed
-					 * with new request.
-					 */
-					BUG_ON(card->host->areq);
-					goto start_new_req;
-				}
-				break;
-			}
-			goto cmd_abort;
+			if (mmc_blk_reset(md, card->host, type))
+				goto cmd_abort;
+			if (!ret)
+				/*
+				 * We have successfully completed block
+				 * request and notified to upper layers.
+				 * As the reset is successful, assume
+				 * h/w is in clean state and proceed
+				 * with new request.
+				 */
+				BUG_ON(card->host->areq);
+				goto start_new_req;
+			break;
 		case MMC_BLK_RETRY:
 			if (retry++ < MMC_BLK_MAX_RETRIES)
 				break;

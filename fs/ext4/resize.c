@@ -377,7 +377,7 @@ static int set_flexbg_block_bitmap(struct super_block *sb, handle_t *handle,
 		start = ext4_group_first_block_no(sb, group);
 		group -= flex_gd->groups[0].group;
 
-		count2 = sb->s_blocksize * 8 - (block - start);
+		count2 = EXT4_BLOCKS_PER_GROUP(sb) - (block - start);
 		if (count2 > count)
 			count2 = count;
 
@@ -991,7 +991,7 @@ static void update_backups(struct super_block *sb,
 		    (err = ext4_journal_restart(handle, EXT4_MAX_TRANS_DATA)))
 			break;
 
-		bh = sb_getblk(sb, group * bpg + blk_off);
+		bh = sb_getblk(sb, ((ext4_fsblk_t)group) * bpg + blk_off);
 		if (!bh) {
 			err = -ENOMEM;
 			break;

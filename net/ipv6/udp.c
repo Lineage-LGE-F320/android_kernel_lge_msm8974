@@ -349,14 +349,11 @@ int udpv6_recvmsg(struct kiocb *iocb, struct sock *sk,
 	int is_udp4;
 	bool slow;
 
-	if (addr_len)
-		*addr_len=sizeof(struct sockaddr_in6);
-
 	if (flags & MSG_ERRQUEUE)
-		return ipv6_recv_error(sk, msg, len);
+		return ipv6_recv_error(sk, msg, len, addr_len);
 
 	if (np->rxpmtu && np->rxopt.bits.rxpmtu)
-		return ipv6_recv_rxpmtu(sk, msg, len);
+		return ipv6_recv_rxpmtu(sk, msg, len, addr_len);
 
 try_again:
 	skb = __skb_recv_datagram(sk, flags | (noblock ? MSG_DONTWAIT : 0),
@@ -426,7 +423,7 @@ try_again:
 			if (ipv6_addr_type(&sin6->sin6_addr) & IPV6_ADDR_LINKLOCAL)
 				sin6->sin6_scope_id = IP6CB(skb)->iif;
 		}
-
+		*addr_len = sizeof(*sin6);
 	}
 	if (is_udp4) {
 		if (inet->cmsg_flags)
@@ -1321,6 +1318,7 @@ static struct sk_buff *udp6_ufo_fragment(struct sk_buff *skb,
 	u8 frag_hdr_sz = sizeof(struct frag_hdr);
 	int offset;
 	__wsum csum;
+	int err;
 
 	mss = skb_shinfo(skb)->gso_size;
 	if (unlikely(skb->len <= mss))
@@ -1357,7 +1355,10 @@ static struct sk_buff *udp6_ufo_fragment(struct sk_buff *skb,
 	/* Find the unfragmentable header and shift it left by frag_hdr_sz
 	 * bytes to insert fragment header.
 	 */
-	unfrag_ip6hlen = ip6_find_1stfragopt(skb, &prevhdr);
+	err = ip6_find_1stfragopt(skb, &prevhdr);
+	if (err < 0)
+		return ERR_PTR(err);
+	unfrag_ip6hlen = err;
 	nexthdr = *prevhdr;
 	*prevhdr = NEXTHDR_FRAGMENT;
 	unfrag_len = skb_network_header(skb) - skb_mac_header(skb) +
@@ -1371,7 +1372,7 @@ static struct sk_buff *udp6_ufo_fragment(struct sk_buff *skb,
 	fptr = (struct frag_hdr *)(skb_network_header(skb) + unfrag_ip6hlen);
 	fptr->nexthdr = nexthdr;
 	fptr->reserved = 0;
-	ipv6_select_ident(fptr, (struct rt6_info *)skb_dst(skb));
+	fptr->identification = skb_shinfo(skb)->ip6_frag_id;
 
 	/* Fragment the skb. ipv6 header and the remaining fields of the
 	 * fragment header are updated in ipv6_gso_segment()
