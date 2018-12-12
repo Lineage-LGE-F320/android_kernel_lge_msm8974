@@ -9894,6 +9894,32 @@ static s32 wl_get_assoc_ies(struct bcm_cfg80211 *cfg, struct net_device *ndev)
 	assoc_info.req_len = htod32(assoc_info.req_len);
 	assoc_info.resp_len = htod32(assoc_info.resp_len);
 	assoc_info.flags = htod32(assoc_info.flags);
+
+	if (assoc_info.req_len >
+		(MAX_REQ_LINE + sizeof(struct dot11_assoc_req) +
+		((assoc_info.flags & WLC_ASSOC_REQ_IS_REASSOC) ?
+		ETHER_ADDR_LEN : 0))) {
+		err = BCME_BADLEN;
+		goto exit;
+	}
+	if ((assoc_info.req_len > 0) &&
+	    (assoc_info.req_len < (sizeof(struct dot11_assoc_req) +
+		((assoc_info.flags & WLC_ASSOC_REQ_IS_REASSOC) ?
+		ETHER_ADDR_LEN : 0)))) {
+		err = BCME_BADLEN;
+		goto exit;
+	}
+	if (assoc_info.resp_len >
+		(MAX_REQ_LINE + sizeof(struct dot11_assoc_resp))) {
+		err = BCME_BADLEN;
+		goto exit;
+	}
+	if ((assoc_info.resp_len > 0) &&
+		(assoc_info.resp_len < sizeof(struct dot11_assoc_resp))) {
+		err = BCME_BADLEN;
+		goto exit;
+	}
+  
 	if (conn_info->req_ie_len) {
 		conn_info->req_ie_len = 0;
 		bzero(conn_info->req_ie, sizeof(conn_info->req_ie));
@@ -9902,48 +9928,42 @@ static s32 wl_get_assoc_ies(struct bcm_cfg80211 *cfg, struct net_device *ndev)
 		conn_info->resp_ie_len = 0;
 		bzero(conn_info->resp_ie, sizeof(conn_info->resp_ie));
 	}
+  
 	if (assoc_info.req_len) {
-		err = wldev_iovar_getbuf(ndev, "assoc_req_ies", NULL, 0, cfg->extra_buf,
-			WL_ASSOC_INFO_MAX, NULL);
+		err = wldev_iovar_getbuf(ndev, "assoc_req_ies", NULL, 0,
+				cfg->extra_buf, WL_ASSOC_INFO_MAX, NULL);
 		if (unlikely(err)) {
 			WL_ERR(("could not get assoc req (%d)\n", err));
-			return err;
+			goto exit;
 		}
-		conn_info->req_ie_len = assoc_info.req_len - sizeof(struct dot11_assoc_req);
+		conn_info->req_ie_len = assoc_info.req_len -
+			sizeof(struct dot11_assoc_req);
 		if (assoc_info.flags & WLC_ASSOC_REQ_IS_REASSOC) {
 			conn_info->req_ie_len -= ETHER_ADDR_LEN;
 		}
-		if (conn_info->req_ie_len <= MAX_REQ_LINE)
-			memcpy(conn_info->req_ie, cfg->extra_buf, conn_info->req_ie_len);
-		else {
-			WL_ERR(("IE size %d above max %d size \n",
-				conn_info->req_ie_len, MAX_REQ_LINE));
-			return err;
-		}
-	} else {
-		conn_info->req_ie_len = 0;
+		memcpy(conn_info->req_ie, cfg->extra_buf,
+			conn_info->req_ie_len);
 	}
+
 	if (assoc_info.resp_len) {
-		err = wldev_iovar_getbuf(ndev, "assoc_resp_ies", NULL, 0, cfg->extra_buf,
-			WL_ASSOC_INFO_MAX, NULL);
+		err = wldev_iovar_getbuf(ndev, "assoc_resp_ies", NULL, 0,
+				cfg->extra_buf, WL_ASSOC_INFO_MAX, NULL);
 		if (unlikely(err)) {
 			WL_ERR(("could not get assoc resp (%d)\n", err));
-			return err;
+			goto exit;
 		}
-		conn_info->resp_ie_len = assoc_info.resp_len -sizeof(struct dot11_assoc_resp);
-		if (conn_info->resp_ie_len <= MAX_REQ_LINE)
-			memcpy(conn_info->resp_ie, cfg->extra_buf, conn_info->resp_ie_len);
-		else {
-			WL_ERR(("IE size %d above max %d size \n",
-				conn_info->resp_ie_len, MAX_REQ_LINE));
-			return err;
-		}
-	} else {
-		conn_info->resp_ie_len = 0;
+		conn_info->resp_ie_len =
+			assoc_info.resp_len - sizeof(struct dot11_assoc_resp);
+		memcpy(conn_info->resp_ie, cfg->extra_buf,
+				conn_info->resp_ie_len);
 	}
-	WL_DBG(("req len (%d) resp len (%d)\n", conn_info->req_ie_len,
-		conn_info->resp_ie_len));
 
+exit:
+	if (err) {
+		WL_ERR(("err:%d assoc-req:%u,resp:%u conn-req:%u,resp:%u\n",
+			err, assoc_info.req_len, assoc_info.resp_len,
+			conn_info->req_ie_len, conn_info->resp_ie_len));
+	}
 	return err;
 }
 
@@ -10353,16 +10373,6 @@ wl_notify_gscan_event(struct bcm_cfg80211 *cfg, bcm_struct_cfgdev *cfgdev,
 	u32 len = ntoh32(e->datalen);
 
 	switch (event) {
-		case WLC_E_PFN_SWC:
-			ptr = dhd_dev_swc_scan_event(ndev, data, &send_evt_bytes);
-			if (send_evt_bytes) {
-#if (LINUX_VERSION_CODE > KERNEL_VERSION(3, 13, 0)) || defined(WL_VENDOR_EXT_SUPPORT)
-				wl_cfgvendor_send_async_event(wiphy, ndev,
-				    GOOGLE_GSCAN_SIGNIFICANT_EVENT, ptr, send_evt_bytes);
-#endif /* (LINUX_VERSION_CODE > KERNEL_VERSION(3, 13, 0)) || defined(WL_VENDOR_EXT_SUPPORT) */
-				kfree(ptr);
-			}
-			break;
 		case WLC_E_PFN_BEST_BATCHING:
 			err = dhd_dev_retrieve_batch_scan(ndev);
 			if (err < 0) {
@@ -11103,7 +11113,6 @@ static void wl_init_event_handler(struct bcm_cfg80211 *cfg)
 	cfg->evt_handler[WLC_E_PFN_BEST_BATCHING] = wl_notify_gscan_event;
 	cfg->evt_handler[WLC_E_PFN_SCAN_COMPLETE] = wl_notify_gscan_event;
 	cfg->evt_handler[WLC_E_PFN_GSCAN_FULL_RESULT] = wl_notify_gscan_event;
-	cfg->evt_handler[WLC_E_PFN_SWC] = wl_notify_gscan_event;
 	cfg->evt_handler[WLC_E_PFN_BSSID_NET_FOUND] = wl_notify_gscan_event;
 	cfg->evt_handler[WLC_E_PFN_BSSID_NET_LOST] = wl_notify_gscan_event;
 #endif /* GSCAN_SUPPORT */
